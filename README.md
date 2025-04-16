@@ -7,7 +7,7 @@ This section explains how to build the library along with its unit and integrati
 The build requirements are git, cmake, and a compiler such as GCC, Clang, or MSVC.
 
 #### Linux:
-##### Ubuntu
+##### Ubuntu:
 
-''' sudo apt get update
-    sudo apt-get install build-essential cmake git '''
+``` sudo apt get update
+    sudo apt-get install build-essential cmake git ```
