@@ -9,5 +9,8 @@ The build requirements are git, cmake, and a compiler such as GCC, Clang, or MSV
 #### Linux:
 ##### Ubuntu:
 
-``` sudo apt get update
-    sudo apt-get install build-essential cmake git ```
+``` 
+sudo apt get update
+sudo apt-get install build-essential cmake git 
+
+```
