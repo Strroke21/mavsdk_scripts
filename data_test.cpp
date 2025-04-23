@@ -47,25 +47,28 @@ bool goto_waypoint(System& system, float target_lat, float target_lon, float tar
     MavlinkPassthrough mavlink_passthrough{system};
     Telemetry telemetry{system};
 
-    mavlink_message_t msg;
+    mavlink_message_t msg; // NOT const here
+
     mavlink_msg_set_position_target_global_int_pack(
         mavlink_passthrough.get_our_sysid(),
         mavlink_passthrough.get_our_compid(),
         &msg,
-        static_cast<uint32_t>(0), // time_boot_ms (ignored)
+        static_cast<uint32_t>(0),
         1, // target system
         1, // target component
-        MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, // use relative altitude
-        0b0000111111111000, // type_mask: ignore everything except position
-        static_cast<int32_t>(target_lat * 1e7), // latitude in int degrees
-        static_cast<int32_t>(target_lon * 1e7), // longitude in int degrees
-        target_alt, // relative altitude in meters
-        0, 0, 0, // vx, vy, vz (ignored)
-        0, 0, 0, // acceleration (ignored)
-        0, 0     // yaw, yaw_rate (ignored)
+        MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        0b0000111111111000,
+        static_cast<int32_t>(target_lat * 1e7),
+        static_cast<int32_t>(target_lon * 1e7),
+        target_alt,
+        0, 0, 0,
+        0, 0, 0,
+        0, 0
     );
 
+    // Safe to send as const now
     auto result = mavlink_passthrough.send_message(msg);
+
     if (result != MavlinkPassthrough::Result::Success) {
         std::cerr << "Failed to send waypoint: " << static_cast<int>(result) << std::endl;
         return false;
@@ -120,16 +123,13 @@ std::pair<float, float> relative_pos(double lat, double lon, double distance, do
     return std::make_pair(new_lat, new_lon);
 }
 
-std::vector<double> get_global_position(System& system) {
-    Telemetry telemetry(system);
+std::pair<double, double> get_global_position(System& system, Telemetry& telemetry) {
+    // Get current position (non-blocking snapshot)
     Telemetry::Position position = telemetry.position();
+    double current_lat = position.latitude_deg;
+    double current_lon  = position.longitude_deg;
 
-    std::vector<double> global_position;
-    global_position.push_back(position.latitude_deg);
-    global_position.push_back(position.longitude_deg);
-    global_position.push_back(position.relative_altitude_m);
-
-    return global_position;
+    return std::make_pair(current_lat, current_lon);
 }
 
 bool takeoff(System& system, float takeoff_altitude_m) {
@@ -189,6 +189,24 @@ bool set_flight_mode(System& system, uint8_t base_mode, uint8_t custom_mode) {
     return mavlink_passthrough.send_message(msg) == MavlinkPassthrough::Result::Success;
 }
 
+bool enable_data_stream(System& system, uint8_t stream_id, uint16_t rate) {
+    MavlinkPassthrough mavlink_passthrough(system);
+
+    mavlink_message_t msg;
+    mavlink_msg_request_data_stream_pack(
+        mavlink_passthrough.get_our_sysid(),
+        mavlink_passthrough.get_our_compid(),
+        &msg,
+        system.get_system_id(),
+        1, // target component
+        stream_id,
+        rate,
+        1  // start streaming (1 = start, 0 = stop)
+    );
+
+    return mavlink_passthrough.send_message(msg) == MavlinkPassthrough::Result::Success;
+}
+
 
 bool set_velocity(System& system, float vx, float vy, float vz, float yaw_rate_deg) {
     Offboard offboard(system);
@@ -217,6 +235,20 @@ bool set_velocity(System& system, float vx, float vy, float vz, float yaw_rate_d
     offboard.stop();
 
     return true;
+}
+
+double distance_to_home(System& system, Telemetry& telemetry) {
+    // Get current position (non-blocking snapshot)
+    Telemetry::Position position = telemetry.position();
+    double current_lat = position.latitude_deg;
+    double current_lon  = position.longitude_deg;
+
+    // Get home position
+    Telemetry::Position home = telemetry.home();
+    double home_lat = home.latitude_deg;
+    double home_lon  = home.longitude_deg;
+
+    return distance_between(current_lat, current_lon, home_lat, home_lon);
 }
 
 //main function
@@ -248,13 +280,18 @@ int main() {
     //     std::cout << "Health status: " << (all_ok ? "OK" : "NOT OK") << std::endl;
     // });
 
+    enable_data_stream(*system, MAV_DATA_STREAM_ALL,100);
+    std::cout << "Data stream enabled." << std::endl;
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    Telemetry telemetry{system}; //initialize telemetry
+
     while (true) {  
 
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        std::vector<double> position = get_global_position(*system);
-        std::cout << "Current position: " << std::fixed << std::setprecision(7) 
-                << "Latitude: " << position[0] << ", Longitude: " << position[1] 
-                << ", Altitude: " << position[2] << " meters." << std::endl;
+        // Telemetry::Position position = telemetry.position();
+
+        // double current_lat = position.latitude_deg;
+        // double current_lon = position.longitude_deg;
+        // std::cout << "Current position: " << current_lat << ", " << current_lon << std::endl;
 
         // telemetry.subscribe_battery([](Telemetry::Battery battery) {
         //     std::cout << "Battery: " << static_cast<int32_t> (battery.remaining_percent) <<" %" << std::endl;
@@ -263,12 +300,15 @@ int main() {
         // telemetry.subscribe_flight_mode([](Telemetry::FlightMode flight_mode) {
         //     std::cout << "Flight mode: " << flight_mode << std::endl;
         // });
-    
-        // Set mode to GUIDED
-        // Call the takeoff function
 
-        std::atomic<bool> target_reached{false};
+        //std::atomic<bool> target_reached{false};
+        auto [lat,lon] = get_global_position(*system, telemetry);
+        std::cout << std::fixed << std::setprecision(7);
+        std::cout << "Global position: " "Current Lat:" << lat << " " << "Current Lon: "<<lon << std::endl;
+        double dist_to_home = distance_to_home(*system, telemetry);
+        std::cout << "Distance to home: " << dist_to_home << " meters." << std::endl;
         counter++;
+
         if (counter == 1) {
             // Set the flight mode to GUIDED
             set_flight_mode(*system, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4);
@@ -284,6 +324,13 @@ int main() {
             goto_waypoint(*system, target_lat, target_lon, target_alt);
 
         }
+
+        if (dist_to_home>=35){
+            std::cout << "Mission complete. Returning to home." << std::endl;
+            set_flight_mode(*system, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6);
+            std::cout << "Flight mode set to RTL." << std::endl;
+            std::chrono::seconds(5);
+        }
     }
     
     // while (!target_reached) {
@@ -291,7 +338,7 @@ int main() {
     //     std::this_thread::sleep_for(std::chrono::milliseconds(200));  // Don't hammer the CPU
     // }
 
-    return 0;
+    // return 0;
 }
 
 //g++ data_test.cpp -lmavsdk -lpthread -o data_test (compile command)
