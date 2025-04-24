@@ -15,14 +15,24 @@
 using namespace mavsdk;
 
 //varibles
-double target_lat = -35.3629024;
-double target_lon = 149.1652153;
+double target_lat = -35.3632604;
+double target_lon = 149.1652353;
 double distance = 10.0; // Distance in meters
-double angle = 90.0; // Angle in degrees
-double heading = 0.0; // Heading in degrees
-double follower_heading = 1.0; // Follower heading in degrees
+double leader_yaw = 0.0; // Angle in degrees (from leader) (assumed: it will come from rfd telemetry)
+double follower_heading = 90.0; // Heading in degrees (for follower)
 int counter = 0;
 float target_alt = 10.0; // Target altitude in meters
+float pos_tolerence = 2.0; // Position tolerence in meters
+float kp = 1.5; // Proportional gain for position control
+float lead_vx = 2.0; //(assumed for now)
+float lead_vy = 2.0; //(assumed for now)
+
+
+std::vector<double> get_leader_position(){
+
+    // This function should return the leader's position
+    
+}
 
 double distance_between(double current_lat, double current_lon, double leader_lat, double leader_lon) {
     // Convert degrees to radians
@@ -99,6 +109,30 @@ bool goto_waypoint(System& system, float target_lat, float target_lon, float tar
 
 }
 
+
+void set_velocity(System& system, float vx, float vy, float vz) {
+    MavlinkPassthrough mavlink_passthrough{system};
+
+    mavlink_message_t msg;
+
+    mavlink_msg_set_position_target_local_ned_pack(
+        mavlink_passthrough.get_our_sysid(),
+        mavlink_passthrough.get_our_compid(),
+        &msg,
+        static_cast<uint32_t>(0),   // time_boot_ms (can be 0 or from telemetry)
+        1,                          // target_system (usually 1)
+        1,                          // target_component (usually 1)
+        MAV_FRAME_LOCAL_NED,       // coordinate frame
+        0b0000111111000111,         // type_mask (only vx, vy, vz are active)
+        0.0f, 0.0f, 0.0f,           // x, y, z position (ignored)
+        vx, vy, vz,                 // velocity in m/s
+        0.0f, 0.0f, 0.0f,           // acceleration (ignored)
+        0.0f, 0.0f                  // yaw, yaw_rate (ignored)
+    );
+
+    mavlink_passthrough.send_message(msg);
+}
+
 std::pair<float, float> relative_pos(double lat, double lon, double distance, double heading, double follower_heading) {
     const double EARTH_RADIUS = 6378137.0; // Earth's radius in meters
 
@@ -123,6 +157,24 @@ std::pair<float, float> relative_pos(double lat, double lon, double distance, do
     return std::make_pair(new_lat, new_lon);
 }
 
+
+bool formation(System& system, double angle_to_leader, double dist_to_leader, double form_alt, double leader_lat, double leader_lon, double leader_yaw){
+
+    int form_counter = 0;
+    while (true){
+        form_counter++;
+        auto [lat, lon] = relative_pos(leader_lat, leader_lon, dist_to_leader, leader_yaw, angle_to_leader);
+        std::cout << "Follower position: " << lat << ", " << lon << std::endl;
+        
+        if (form_counter == 1) {
+            std::cout << "Formation command sent to reach target waypoint." << std::endl;
+            goto_waypoint(system, lat, lon, form_alt);
+            return true;
+        }
+    }
+
+}
+
 std::pair<double, double> get_global_position(System& system, Telemetry& telemetry) {
     // Get current position (non-blocking snapshot)
     Telemetry::Position position = telemetry.position();
@@ -130,6 +182,17 @@ std::pair<double, double> get_global_position(System& system, Telemetry& telemet
     double current_lon  = position.longitude_deg;
 
     return std::make_pair(current_lat, current_lon);
+}
+
+float current_heading(System& system, Telemetry& telemetry){
+    // Get current heading (non-blocking snapshot)
+    Telemetry::EulerAngle euler_angle = telemetry.attitude_euler();
+    float current_heading = euler_angle.yaw_deg;
+
+    if (current_heading < 0) {
+        current_heading += 360.0f; // Normalize to [0, 360)
+    }
+
 }
 
 bool takeoff(System& system, float takeoff_altitude_m) {
@@ -171,7 +234,37 @@ bool takeoff(System& system, float takeoff_altitude_m) {
     
 }
 
+void geo_distance_components(System& system, double current_lat, double current_lon, double target_lat, double target_lon, float tolerence, float kp, float lead_vx, float lead_vy ){
+    
+    const float R = 6378137.0;  // Earth radius in meters
+    double dlat = (target_lat - current_lat) * M_PI / 180.0; //in radians
+    double dlon = (target_lon - current_lon) * M_PI / 180.0; //in radians
 
+    //normalize dlon to -pi to pi
+    double dlon_normalized = fmod((dlon + M_PI), (2 * M_PI)) - M_PI;
+    //debugging intermediate values
+    double mean_lat = ((current_lat * M_PI/180) + (target_lat * M_PI/180)) / 2.0; //in radians
+
+    //North-South component (y): R * delta_lat
+    float y = R * dlat;
+
+    //East-West component (x): R * delta_lon * cos(mean_lat)
+    float x = R * dlon_normalized * cos(mean_lat);
+    
+    std::cout << "Distace to Target: "<< "X: " << x << " Y: " << y << std::endl;
+
+    if (fabs(x) > tolerence) {
+        float vx = kp * lead_vx;
+        set_velocity(system, vx, 0.0, 0.0); // Send velocity command
+        std::cout << "pos_x correction: " << vx << std::endl;
+    }
+    if (fabs(y) > tolerence) {
+        float vy = kp * lead_vy;
+        set_velocity(system, 0.0, vy, 0.0); // Send velocity command
+        std::cout << "pos_y correction: " << vy << std::endl;
+    }
+
+}
 
 bool set_flight_mode(System& system, uint8_t base_mode, uint8_t custom_mode) {
     MavlinkPassthrough mavlink_passthrough(system);
@@ -207,41 +300,13 @@ bool enable_data_stream(System& system, uint8_t stream_id, uint16_t rate) {
     return mavlink_passthrough.send_message(msg) == MavlinkPassthrough::Result::Success;
 }
 
-
-bool set_velocity(System& system, float vx, float vy, float vz, float yaw_rate_deg) {
-    Offboard offboard(system);
-
-    Offboard::VelocityBodyYawspeed velocity{};
-    velocity.forward_m_s = vx;
-    velocity.right_m_s = vy;
-    velocity.down_m_s = vz;
-    velocity.yawspeed_deg_s = yaw_rate_deg;
-
-    // Start the offboard mode
-    std::cout << "Sending initial setpoint..." << std::endl;
-    offboard.set_velocity_body(velocity);
-    auto offboard_result = offboard.start();
-    if (offboard_result != Offboard::Result::Success) {
-        std::cerr << "Offboard start failed: " << offboard_result << std::endl;
-        return false;
-    }
-
-    std::cout << "Offboard started. Sending velocity..." << std::endl;
-    offboard.set_velocity_body(velocity);
-
-    std::this_thread::sleep_for(std::chrono::seconds(5));
-
-    // Stop offboard mode after command
-    offboard.stop();
-
-    return true;
-}
-
 double distance_to_home(System& system, Telemetry& telemetry) {
     // Get current position (non-blocking snapshot)
     Telemetry::Position position = telemetry.position();
     double current_lat = position.latitude_deg;
     double current_lon  = position.longitude_deg;
+    std::cout << std::fixed << std::setprecision(7);
+    std::cout << "Current position: " << current_lat << ", " << current_lon << std::endl;
 
     // Get home position
     Telemetry::Position home = telemetry.home();
@@ -287,6 +352,8 @@ int main() {
 
     while (true) {  
 
+        // get leader position
+
         // Telemetry::Position position = telemetry.position();
 
         // double current_lat = position.latitude_deg;
@@ -302,7 +369,8 @@ int main() {
         // });
 
         //std::atomic<bool> target_reached{false};
-        auto [lat,lon] = get_global_position(*system, telemetry);
+        //Telemetry::Position position = telemetry.position();
+        auto [lat, lon] = get_global_position(*system, telemetry);
         std::cout << std::fixed << std::setprecision(7);
         std::cout << "Global position: " "Current Lat:" << lat << " " << "Current Lon: "<<lon << std::endl;
         double dist_to_home = distance_to_home(*system, telemetry);
@@ -313,30 +381,26 @@ int main() {
             // Set the flight mode to GUIDED
             set_flight_mode(*system, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4);
             std::cout << "Flight mode set to GUIDED." << std::endl;
-
             //arm and takeoff
             if (!takeoff(*system,10.0f)) {
                 return 1;
             }
             std::cout << "Takeoff successful." << std::endl;
-
-            //start mission
-            goto_waypoint(*system, target_lat, target_lon, target_alt);
-
+            formation(*system, follower_heading, distance, target_alt, target_lat, target_lon, leader_yaw);
+            //set_velocity(*system, 10.0f, 0.0f, 0.0f); // Stop the drone
+            std::chrono::seconds(1);
+        
         }
 
-        if (dist_to_home>=35){
-            std::cout << "Mission complete. Returning to home." << std::endl;
-            set_flight_mode(*system, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6);
-            std::cout << "Flight mode set to RTL." << std::endl;
-            std::chrono::seconds(5);
-        }
+        //auto[leader_lat, leader_lon, leader_yaw, leader_vx, leader_vy] = get_leader_position();
+        //set_velocity(*system, leader_vx, leader_vy, 0.0f); 
+        //geo_distance_components(*system, lat, lon, target_lat, target_lon, pos_tolerence, kp, leader_vx, leader_vy);
+        
+
+        //     std::cout << "Mission complete. Returning to home." << std::endl;
+        //     set_flight_mode(*system, MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 6);
+        //     std::cout << "Flight mode set to RTL." << std::endl;
     }
-    
-    // while (!target_reached) {
-    //     set_velocity(*system, 1.0f, 0.0f, 0.0f, 0.0f);  
-    //     std::this_thread::sleep_for(std::chrono::milliseconds(200));  // Don't hammer the CPU
-    // }
 
     // return 0;
 }
